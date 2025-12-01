@@ -4,6 +4,7 @@ import csv
 import json
 import argparse
 import threading
+import time
 import requests
 import xml.etree.ElementTree as ET
 from queue import Queue
@@ -35,13 +36,26 @@ def resolve_filepath(url: str, out_folder: str, preserve_path: bool) -> str:
         return os.path.join(out_folder, filename)
 
 
-def producer(url, queue, filepath):
+def producer(url, queue, filepath, timeout, max_retries, retry_backoff):
     try:
         print(f"[Producer] Downloading: {url}")
-        response = requests.get(url, timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
-        queue.put((url, response, filepath))
-        print(f"[Producer] Done: {url}")
+        last_exc = None
+        attempts = max_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.get(url, timeout=timeout)
+                response.raise_for_status()
+                queue.put((url, response, filepath))
+                print(f"[Producer] Done: {url}")
+                return
+            except Exception as e:
+                last_exc = e
+                if attempt < attempts:
+                    sleep_for = retry_backoff * (2 ** (attempt - 1))
+                    print(f"[Producer] Retry {attempt}/{attempts - 1} for {url} in {sleep_for:.1f}s due to: {e}")
+                    time.sleep(sleep_for)
+        # all retries failed
+        print(f"[Producer] Error downloading {url}: {last_exc}")
     except Exception as e:
         print(f"[Producer] Error downloading {url}: {e}")
 
@@ -108,7 +122,7 @@ def load_from_csv(path: str, column: str) -> set:
         return urls
     with open(path, newline="", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
-        if column not in reader.fieldnames:
+        if not reader.fieldnames or column not in reader.fieldnames:
             print(f"CSV column '{column}' not found in {path}. Columns: {reader.fieldnames}")
             return urls
         for row in reader:
@@ -175,11 +189,11 @@ def load_from_json(path: str, key: str | None) -> set:
     return urls
 
 
-def load_from_sitemap(source: str) -> set:
+def load_from_sitemap(source: str, timeout: float) -> set:
     urls = set()
     try:
         if is_valid_url(source):
-            resp = requests.get(source, timeout=DEFAULT_TIMEOUT)
+            resp = requests.get(source, timeout=timeout)
             resp.raise_for_status()
             content = resp.content
         else:
@@ -224,14 +238,13 @@ def load_urls(args):
         urls |= load_from_json(args.json, args.json_key)
 
     if args.sitemap:
-        urls |= load_from_sitemap(args.sitemap)
+        urls |= load_from_sitemap(args.sitemap, args.timeout)
 
     return urls
 
 
 def main():
     parser = argparse.ArgumentParser(description="Parallel file downloader.")
-    # Input sources
     parser.add_argument("--urls", nargs="*", help="List of URLs")
     parser.add_argument("--file", help="File with URLs (one per line)")
     parser.add_argument("--stdin", action="store_true", help="Read URLs from stdin (one per line)")
@@ -242,15 +255,19 @@ def main():
                         help="Key or dotted path in JSON pointing to URL(s). If omitted, tries best-effort extraction.")
     parser.add_argument("--sitemap", help="Sitemap path or URL to extract URLs from")
 
-    # Output and behavior
     parser.add_argument("--out", help="Output directory", default="downloaded")
     parser.add_argument("--preserve-path", action="store_true",
                         help="Preserve URL path structure under output directory")
     parser.add_argument("--skip-existing", action="store_true", help="Skip downloading files that already exist")
 
-    # Concurrency
     parser.add_argument("--producers", type=int, default=3, help="Number of producer (download) threads")
     parser.add_argument("--consumers", type=int, default=3, help="Number of consumer (save) threads")
+
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--max-retries", type=int, default=0, help="Max retries per URL on failure (default: 0)")
+    parser.add_argument("--retry-backoff", type=float, default=1.0,
+                        help="Base backoff seconds for retries (exponential)")
 
     args = parser.parse_args()
     urls = load_urls(args)
@@ -285,7 +302,10 @@ def main():
 
     for url in to_download:
         filepath = url_to_path[url]
-        t = threading.Thread(target=producer, args=(url, queue, filepath))
+        t = threading.Thread(
+            target=producer,
+            args=(url, queue, filepath, args.timeout, args.max_retries, args.retry_backoff),
+        )
         t.start()
         producer_threads.append(t)
 
